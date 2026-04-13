@@ -39,6 +39,10 @@ runs:
           echo "Prepared omni-qwen3 environment is missing. Run the docs stage first."
           exit 1
         }
+        omni-qwen3/bin/python -c "import torch" 2>/dev/null || {
+          echo "Cached venv is corrupted (torch not importable). Re-run the docs stage."
+          exit 1
+        }
 
     - name: Remove flashinfer
       shell: bash
