@@ -170,4 +170,3 @@ jobs:
         shell: bash
         run: |
           bash .github/scripts/delete_gpu_process.sh
-ma
