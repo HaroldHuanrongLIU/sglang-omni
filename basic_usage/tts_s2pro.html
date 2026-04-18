@@ -661,6 +661,15 @@ hf<span class="w"> </span>download<span class="w"> </span>fishaudio/s2-pro
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>./playground/tts/start.sh
 </pre></div>
 </div>
+<p>The playground now exposes two demo modes against the same S2 Pro backend:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">Non-Streaming</span></code> starts a standard request and shows the final WAV after generation finishes.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">Streaming</span></code> consumes the <code class="docutils literal notranslate"><span class="pre">/v1/audio/speech</span></code> SSE stream, starts playback from incremental WAV chunks, and also writes a final combined WAV artifact for inspection.</p></li>
+</ul>
+<p>The launcher starts the backend first, waits for <code class="docutils literal notranslate"><span class="pre">/health</span></code>, then starts the Gradio UI with:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-m<span class="w"> </span>playground.tts.app<span class="w"> </span>--api-base<span class="w"> </span>http://localhost:8000
+</pre></div>
+</div>
 <p>A demo play video is available <a class="reference external" href="https://x.com/lmsysorg/status/2031412267213008984/video/1">here</a>. We highly recommend using playground since audio data is hard to intertact with by CLI.</p>
 </section>
 </section>
