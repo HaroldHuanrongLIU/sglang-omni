@@ -119,7 +119,9 @@ def load_videomme_samples(
         if split_name.startswith(f"{split}_part_")
     )
     if split_parts:
-        ds = concatenate_datasets([all_splits[split_name] for split_name in split_parts])
+        ds = concatenate_datasets(
+            [all_splits[split_name] for split_name in split_parts]
+        )
     elif split in all_splits:
         ds = all_splits[split]
     else:
