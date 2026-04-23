@@ -1,5 +1,68 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Video-MME benchmark for sglang-omni models."""
+"""Video-MME benchmark for sglang-omni models.
+
+Evaluates video understanding accuracy and performance on the Video-MME
+test set via /v1/chat/completions with video input. Each sample is a
+multiple-choice question (A-D) grounded in a YouTube video clip, covering
+short, medium, and long durations across six domains.
+
+Usage:
+    # Smoke test — a handful of samples at c=1
+    python benchmarks/eval/benchmark_omni_videomme.py \
+        --model qwen3-omni --port 8000 --max-samples 10
+
+    # Reference-sized run at c=4 (matches the numbers below)
+    python benchmarks/eval/benchmark_omni_videomme.py \
+        --model qwen3-omni --port 8000 \
+        --max-samples 50 --max-concurrency 4 --max-tokens 256
+
+    # Throughput probe at higher concurrency (raise --mem-fraction-static on
+    # the server if you see CUDA OOM in the vision encoder)
+    python benchmarks/eval/benchmark_omni_videomme.py \
+        --model qwen3-omni --port 8000 \
+        --max-samples 50 --max-concurrency 16
+
+
+H200 Full-Set Reference Results
+
+Reproducibility references for the FULL eval set — NOT CI thresholds.
+CI runs on a 50-sample subset (videomme-ci-50) and has its own thresholds
+elsewhere (see tasks/*.py).
+
+Benchmark: Video-MME |  Dataset: lmms-lab/Video-MME test split
+                        (2520 total questions; 50-sample prefix used here
+                        as an indicative reference — the full 2520-sample
+                        run is ~9 h at c=4 on one H200 because each video
+                        prefill is ~50 s, which exceeds a single debugging
+                        budget)
+Hardware:  1 x H200 (thinker-only; speech disabled)
+Last verified: 2026-04-23
+
+Accuracy (summary)
+
+| Model      | Config                           | accuracy | correct | failed | mc_fallback | Source                                                       |
+| ---------- | -------------------------------- | -------- | ------- | ------ | ----------- | ------------------------------------------------------------ |
+| Qwen3-Omni | thinker-only, mem_fraction=0.65  | 62.00%   | 31/50   | 0      | 2           | PR #327 [H200, 50-sample prefix, c=4, max_tokens=256]        |
+
+Note: full 2520 not run — at c=4 on one H200, video prefill averages
+~50 s/sample (throughput ~0.08 req/s), so the full test split is ~9 h
+wall-clock. The 50-sample prefix documented here matches the subset used
+by the videomme-ci-50 CI job and is sufficient to establish a smoke-test
+baseline. The Qwen3-Omni thinker defaults from commit a40e591
+(thinker_max_seq_len=32768, encoder reserve 0.20) are tuned for
+single-request prompts; they OOM in the vision encoder at c>=4 for
+long-video clips on H200, so this run was taken with
+--mem-fraction-static 0.65 on the server to give the encoder ~48 GB of
+activation headroom. A wider-coverage 300- or 900-sample reference at
+c=4 should be added once a stable multi-hour test slot is available.
+
+Speed (speed)
+
+| Model      | Config                           | latency_mean_s | latency_p95_s | throughput_qps | tok_per_s_mean | tok_per_s_agg | Source                                                 |
+| ---------- | -------------------------------- | -------------- | ------------- | -------------- | -------------- | ------------- | ------------------------------------------------------ |
+| Qwen3-Omni | thinker-only, mem_fraction=0.65  | 48.24          | 78.87         | 0.082          | 2.6            | 2.5           | PR #327 [H200, 50-sample prefix, c=4, max_tokens=256]  |
+"""
+
 
 from __future__ import annotations
 
