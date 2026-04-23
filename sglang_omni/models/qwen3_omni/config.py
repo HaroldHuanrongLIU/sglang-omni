@@ -83,7 +83,7 @@ class Qwen3OmniPipelineConfig(PipelineConfig):
             executor=ExecutorConfig(
                 factory="sglang_omni.models.qwen3_omni.pipeline.stages.create_sglang_thinker_executor_from_config",
                 args={
-                    "thinker_max_seq_len": 8192,
+                    "thinker_max_seq_len": 32768,
                 },
             ),
             get_next="sglang_omni.models.qwen3_omni.pipeline.next_stage.thinker_next",
@@ -216,7 +216,7 @@ class Qwen3OmniSpeechPipelineConfig(PipelineConfig):
             name=THINKER_STAGE,
             executor=ExecutorConfig(
                 factory="sglang_omni.models.qwen3_omni.pipeline.stages.create_sglang_thinker_executor_from_config",
-                args={"thinker_max_seq_len": 8192, "speech_enabled": True},
+                args={"thinker_max_seq_len": 32768, "speech_enabled": True},
             ),
             get_next="sglang_omni.models.qwen3_omni.pipeline.next_stage.thinker_next_speech",
             relay=RelayConfig(device="cuda"),

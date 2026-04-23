@@ -10,12 +10,13 @@ from sglang.srt.server_args import ServerArgs
 
 # SGLang's VLM auto-sizing applies a dynamic 0.95 * factor reserve
 # (roughly [0.8, 1.05]); Qwen3-Omni nests vision/audio configs under
-# `thinker_config` so SGLang's VLM path never triggers for us. 0.05
-# is a conservative linear lower-bound of that dynamic reserve; we
-# subtract it after auto-sizing when the thinker GPU also hosts encoder
-# stages. User-pinned mem_fraction_static bypasses this reserve.
+# `thinker_config` so SGLang's VLM path never triggers for us. 0.20
+# is sized to accommodate Qwen3-Omni/Ming-Omni video encoder peak
+# activations (~30 GB on H200 for large videomme inputs), which run
+# co-located with the thinker GPU outside SGLang's static pool.
+# User-pinned mem_fraction_static bypasses this reserve.
 
-OMNI_ENCODER_MEM_FRACTION_STATIC_RESERVE = 0.05
+OMNI_ENCODER_MEM_FRACTION_STATIC_RESERVE = 0.20
 
 
 def build_sglang_server_args(
