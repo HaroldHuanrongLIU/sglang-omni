@@ -3,6 +3,7 @@
 
 Each factory returns a callable (for SimpleScheduler) or an OmniScheduler.
 """
+
 from __future__ import annotations
 
 import logging
@@ -64,9 +65,15 @@ def store_state(payload: StagePayload, state: S2ProState) -> StagePayload:
 # ---------------------------------------------------------------------------
 
 
-def create_preprocessing_executor(model_path: str):
-    """Returns SimpleScheduler for preprocessing stage."""
-    from sglang_omni_v1.scheduling.simple_scheduler import SimpleScheduler
+def create_preprocessing_executor(
+    model_path: str,
+    *,
+    max_concurrency: int = 8,
+):
+    """Returns a threaded scheduler for CPU-heavy preprocessing."""
+    from sglang_omni_v1.scheduling.threaded_simple_scheduler import (
+        ThreadedSimpleScheduler,
+    )
 
     checkpoint_dir = _resolve_checkpoint(model_path)
 
@@ -141,7 +148,7 @@ def create_preprocessing_executor(model_path: str):
         )
         return store_state(payload, state)
 
-    return SimpleScheduler(_preprocess)
+    return ThreadedSimpleScheduler(_preprocess, max_concurrency=max_concurrency)
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +276,8 @@ def create_vocoder_executor(
     *,
     device: str | None = None,
     gpu_id: int | None = None,
+    max_batch_size: int = 8,
+    max_batch_wait_ms: int = 2,
 ):
     from sglang_omni_v1.scheduling.simple_scheduler import SimpleScheduler
 
@@ -277,13 +286,11 @@ def create_vocoder_executor(
     checkpoint_dir = _resolve_checkpoint(model_path)
     codec = _load_codec(checkpoint_dir, device)
 
-    def _vocode(payload: StagePayload) -> StagePayload:
-        state = load_state(payload)
-        output_codes = state.output_codes
-        codebook_codes = output_codes[1:].to(device)
-        with torch.no_grad():
-            audio = codec.from_indices(codebook_codes[None])
-        audio_np = audio[0, 0].float().cpu()
+    def _store_audio(
+        payload: StagePayload,
+        state: S2ProState,
+        audio_np: torch.Tensor,
+    ) -> StagePayload:
         state.audio_samples = audio_np
         state.sample_rate = codec.sample_rate
         payload = store_state(payload, state)
@@ -292,4 +299,43 @@ def create_vocoder_executor(
         payload.data["modality"] = "audio"
         return payload
 
-    return SimpleScheduler(_vocode)
+    def _vocode(payload: StagePayload) -> StagePayload:
+        state = load_state(payload)
+        output_codes = state.output_codes
+        codebook_codes = output_codes[1:].to(device)
+        with torch.no_grad():
+            audio = codec.from_indices(codebook_codes[None])
+        audio_np = audio[0, 0].float().cpu()
+        return _store_audio(payload, state, audio_np)
+
+    def _vocode_batch(payloads: list[StagePayload]) -> list[StagePayload]:
+        states = [load_state(payload) for payload in payloads]
+        code_batches = [state.output_codes[1:].to(device) for state in states]
+        lengths = [int(codes.shape[-1]) for codes in code_batches]
+        max_len = max(lengths)
+        padded = [
+            torch.nn.functional.pad(codes, (0, max_len - length), value=0)
+            for codes, length in zip(code_batches, lengths)
+        ]
+        batch_codes = torch.stack(padded, dim=0)
+
+        with torch.no_grad():
+            audio = codec.from_indices(batch_codes)
+
+        samples_per_token = int(getattr(codec, "frame_length", 0) or 0)
+        if samples_per_token <= 0:
+            samples_per_token = int(audio.shape[-1] // max(max_len, 1))
+
+        results: list[StagePayload] = []
+        for idx, (payload, state, length) in enumerate(zip(payloads, states, lengths)):
+            sample_len = int(length * samples_per_token)
+            audio_np = audio[idx, 0, :sample_len].float().cpu()
+            results.append(_store_audio(payload, state, audio_np))
+        return results
+
+    return SimpleScheduler(
+        _vocode,
+        batch_compute_fn=_vocode_batch,
+        max_batch_size=max_batch_size,
+        max_batch_wait_ms=max_batch_wait_ms,
+    )
