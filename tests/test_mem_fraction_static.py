@@ -271,6 +271,23 @@ class TestEncoderMemReserveBuilderFloor(unittest.TestCase):
                 )
 
 
+class TestCliMemFlagMutex(unittest.TestCase):
+    """Reject passing both --mem-fraction-static and --encoder-mem-reserve."""
+
+    def test_both_flags_raises(self) -> None:
+        from examples.run_qwen3_omni_server import _check_mem_flag_mutex
+
+        with self.assertRaisesRegex(ValueError, r"mutually exclusive"):
+            _check_mem_flag_mutex(0.65, 0.20)
+
+    def test_either_flag_alone_is_ok(self) -> None:
+        from examples.run_qwen3_omni_server import _check_mem_flag_mutex
+
+        _check_mem_flag_mutex(0.65, None)
+        _check_mem_flag_mutex(None, 0.20)
+        _check_mem_flag_mutex(None, None)
+
+
 class TestH20AutoMemFractionFloor(unittest.TestCase):
     def test_h20_auto_mem_fraction_static_has_expected_floor(self) -> None:
         """On H20 hardware, SGLang's auto-sized mem_fraction_static must sit at or above 0.85."""

@@ -96,15 +96,23 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
-
-    if args.mem_fraction_static is not None and args.encoder_mem_reserve is not None:
+def _check_mem_flag_mutex(
+    mem_fraction_static: float | None,
+    encoder_mem_reserve: float | None,
+) -> None:
+    """Reject both-flags-set; a pinned ``mem_fraction_static`` bypasses the auto path the reserve subtracts from."""
+    if mem_fraction_static is not None and encoder_mem_reserve is not None:
         raise ValueError(
             "--mem-fraction-static and --encoder-mem-reserve are mutually "
             "exclusive: a pinned --mem-fraction-static bypasses the auto "
             "path the reserve subtracts from. Pass only one."
         )
+
+
+def main() -> None:
+    args = parse_args()
+
+    _check_mem_flag_mutex(args.mem_fraction_static, args.encoder_mem_reserve)
 
     overrides = {}
     if args.thinker_max_seq_len is not None:
