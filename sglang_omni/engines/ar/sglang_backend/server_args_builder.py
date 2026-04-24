@@ -20,11 +20,11 @@ def build_sglang_server_args(
 ) -> ServerArgs:
     """Build ServerArgs with shared defaults for all SGLang AR engines.
 
-    When ``mem_fraction_static`` is ``None`` and
-    ``auto_mem_fraction_static_reserve`` is positive, the reserve is
-    subtracted from SGLang's auto-selected ``mem_fraction_static``. If
-    that would leave less than 0.01, we raise instead of silently
-    underfunding SGLang's KV pool.
+    Note (Chenyang):
+    When mem_fraction_static is None and auto_mem_fraction_static_reserve
+    is positive, the reserve is subtracted from SGLang's auto-selected
+     mem_fraction_static. If that would leave less than 0.01, we raise
+    instead of silently underfunding SGLang's KV pool.
     """
     kwargs: dict[str, Any] = {
         "model_path": model_path,
@@ -60,7 +60,8 @@ def _apply_auto_mem_fraction_static_reserve(
 ) -> None:
     """Subtract a caller-requested reserve from SGLang's auto-selected value.
 
-    Raises ``ValueError`` when the remaining ``mem_fraction_static`` would
+    # Note (Chenyang):
+    Raises ValueError when the remaining mem_fraction_static would
     drop below 0.1 — below that, SGLang's KV allocator fails deep in the
     scheduler with a confusing stack trace (empirically crashes ~0.08 on
     H200 for Qwen3-Omni-30B), so surface the failure at build time.
