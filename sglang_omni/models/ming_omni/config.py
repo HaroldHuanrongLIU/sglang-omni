@@ -23,6 +23,26 @@ from sglang_omni.models.ming_omni.pipeline.next_stage import (
 )
 
 
+def _drop_qwen3_only_overrides(overrides: dict[str, Any]) -> None:
+    """Drop keys routed exclusively by the Qwen3-Omni pipeline.
+
+    Ming-Omni's thinker factory does not accept ``encoder_mem_reserve`` and its
+    ``apply_server_args_overrides`` forwards unknown keys into the raw
+    ``ServerArgs(**kwargs)`` unpack, which would raise
+    ``TypeError: unexpected keyword argument 'encoder_mem_reserve'``. We drop
+    the key here so the generic ``sglang_omni.cli.serve`` dispatcher (or any
+    future shared CLI) can safely forward ``encoder_mem_reserve`` without
+    crashing Ming.
+
+    TODO (Ratish, Chenyang):
+    Ming-Omni currently hard-codes ``OMNI_ENCODER_MEM_FRACTION_STATIC_RESERVE``
+    (0.05). If Ming ever needs a runtime-tunable encoder reserve, replace this
+    drop with a per-stage routing path analogous to Qwen3's
+    ``_route_thinker_executor_args``.
+    """
+    overrides.pop("encoder_mem_reserve", None)
+
+
 class MingOmniPipelineConfig(PipelineConfig):
     """6-stage text/vision pipeline for Ming-Omni.
 
@@ -105,6 +125,19 @@ class MingOmniPipelineConfig(PipelineConfig):
     @classmethod
     def mem_fraction_role_to_stage(cls) -> dict[str, str]:
         return {"thinker": THINKER_STAGE}
+
+    def apply_server_args_overrides(
+        self, *, stage_name: str, overrides: dict[str, Any]
+    ) -> None:
+        # Ming does not implement a runtime encoder-mem-reserve path (yet);
+        # drop the key defensively so a future shared CLI can forward it
+        # without Ming crashing at ServerArgs unpack time.
+        cleaned = dict(overrides)
+        _drop_qwen3_only_overrides(cleaned)
+        super().apply_server_args_overrides(
+            stage_name=stage_name,
+            overrides=cleaned,
+        )
 
 
 def _validate_ming_speech_gpu_placement(
@@ -229,9 +262,11 @@ class MingOmniSpeechPipelineConfig(PipelineConfig):
                 self.gpu_placement,
                 tp_size=overrides["tp_size"],
             )
+        cleaned = dict(overrides)
+        _drop_qwen3_only_overrides(cleaned)
         super().apply_server_args_overrides(
             stage_name=stage_name,
-            overrides=overrides,
+            overrides=cleaned,
         )
 
 
