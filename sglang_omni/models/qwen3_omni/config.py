@@ -122,6 +122,28 @@ class Qwen3OmniPipelineConfig(PipelineConfig):
             )
 
 
+def _cast_encoder_mem_reserve(value: Any) -> float:
+    """Cast + validate ``encoder_mem_reserve`` at the config boundary.
+
+    Range ``[0, 1)`` is enforced here (not only at the CLI layer) so every
+    entry point -- the Qwen3 CLI, the generic ``sglang_omni.cli.serve``
+    dispatcher, and programmatic ``apply_server_args_overrides`` callers --
+    hits the same validator and fails early with a clear error, rather than
+    surfacing a confusing downstream SGLang error (e.g. negative
+    ``mem_fraction_static``) at server startup.
+    """
+    val = float(value)
+    if not 0.0 <= val < 1.0:
+        raise ValueError(f"encoder_mem_reserve must be in [0, 1), got {val}")
+    return val
+
+
+_THINKER_EXECUTOR_ARG_CASTS: dict[str, Callable[[Any], Any]] = {
+    "thinker_max_seq_len": int,
+    "encoder_mem_reserve": _cast_encoder_mem_reserve,
+}
+
+
 def _route_thinker_executor_args(
     stages: list[StageConfig],
     stage_name: str,
@@ -146,12 +168,6 @@ def _route_thinker_executor_args(
                 stage.executor.args[key] = cast(value)
                 break
     return remaining
-
-
-_THINKER_EXECUTOR_ARG_CASTS: dict[str, Callable[[Any], Any]] = {
-    "thinker_max_seq_len": int,
-    "encoder_mem_reserve": float,
-}
 
 
 def _validate_qwen3_speech_gpu_placement(

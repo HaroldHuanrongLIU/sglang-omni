@@ -105,10 +105,10 @@ def main() -> None:
     if args.cpu_offload_gb:
         overrides["cpu_offload_gb"] = args.cpu_offload_gb
     if args.encoder_mem_reserve is not None:
-        if not 0.0 <= args.encoder_mem_reserve < 1.0:
-            raise ValueError(
-                f"--encoder-mem-reserve must be in [0, 1), got {args.encoder_mem_reserve}"
-            )
+        # Range check lives in Qwen3OmniPipelineConfig._cast_encoder_mem_reserve
+        # so every entry point (this CLI, generic `sglang_omni.cli.serve`, and
+        # programmatic callers of `apply_server_args_overrides`) shares one
+        # validation boundary.
         overrides["encoder_mem_reserve"] = args.encoder_mem_reserve
 
     config = Qwen3OmniPipelineConfig(
