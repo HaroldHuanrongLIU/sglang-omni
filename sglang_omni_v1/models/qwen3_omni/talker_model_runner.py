@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Qwen3-Omni talker runner with buffer-backed feedback + batched code predictor."""
+"""Qwen3-Omni talker runner with FIFO text/feedback decode handoff."""
 
 from __future__ import annotations
 
-import collections
 from typing import Any
 
 import torch
@@ -52,6 +51,11 @@ class QwenTalkerModelRunner(ModelRunner):
         del schedule_batch
         if not self._feedback_enabled:
             return None
+
+        if not self._requests_ready_for_decode(requests):
+            raise RuntimeError(
+                "Talker decode reached model runner without ready feedback/text input"
+            )
 
         self.model.prepare_decode_buffers(requests)
         self._write_feedback_buffers(requests)
@@ -118,17 +122,7 @@ class QwenTalkerModelRunner(ModelRunner):
                     target=self._code2wav_target,
                 )
             )
-            feedback_step_index = int(sched_req.data.generation_steps)
-            feedback_queue = getattr(sched_req.data, "feedback_queue", None)
-            if feedback_queue is None:
-                feedback_queue = collections.deque()
-                sched_req.data.feedback_queue = feedback_queue
-            feedback_queue.append((feedback_row, feedback_step_index))
-            # Keep the legacy single-slot fields in sync for debugging/tests, but
-            # preserve all pending feedback rows in-order via ``feedback_queue`` so
-            # thinker-stream lag cannot silently drop intermediate feedback.
-            sched_req.data.feedback_embeds = feedback_row
-            sched_req.data.feedback_step_index = feedback_step_index
+            sched_req.data.pending_feedback_queue.append(feedback_row)
 
     def sample_before_post_prefill(
         self, forward_batch: Any, schedule_batch: Any, requests: list
@@ -141,6 +135,14 @@ class QwenTalkerModelRunner(ModelRunner):
     ) -> bool:
         del forward_batch, schedule_batch, requests
         return False
+
+    def is_decode_batch_ready(self, schedule_batch: Any) -> bool:
+        if not self._feedback_enabled or not schedule_batch.forward_mode.is_decode():
+            return True
+        return all(
+            self._data_has_next_decode_input(getattr(req, "_omni_data", None))
+            for req in schedule_batch.reqs
+        )
 
     def _run_projected_prefill_forward(
         self,
@@ -193,7 +195,7 @@ class QwenTalkerModelRunner(ModelRunner):
         feedback_mask[:batch_size] = False
 
         for row_idx, sched_req in enumerate(requests):
-            combined = self._take_next_ready_feedback_embed(
+            combined = self._take_next_decode_input_embed(
                 sched_req=sched_req,
                 device=feedback_buffer.device,
                 dtype=feedback_buffer.dtype,
@@ -204,35 +206,71 @@ class QwenTalkerModelRunner(ModelRunner):
             feedback_mask[row_idx] = True
 
     @staticmethod
-    def _combine_feedback_entry(
+    def _data_has_next_decode_input(data: Any) -> bool:
+        if data is None:
+            return False
+        pending_feedback_queue = getattr(data, "pending_feedback_queue", None)
+        if not pending_feedback_queue:
+            return False
+        pending_text_queue = getattr(data, "pending_text_queue", None)
+        if pending_text_queue:
+            return True
+        return bool(
+            getattr(data, "thinker_chunks_done", False)
+            and getattr(data, "tts_pad_embed", None) is not None
+        )
+
+    def _requests_ready_for_decode(self, requests: list) -> bool:
+        return all(
+            self._data_has_next_decode_input(sched_req.data) for sched_req in requests
+        )
+
+    @staticmethod
+    def _pop_left(queue: Any) -> torch.Tensor | None:
+        if not queue:
+            return None
+        if hasattr(queue, "popleft"):
+            return queue.popleft()
+        if isinstance(queue, list):
+            return queue.pop(0)
+        return None
+
+    @staticmethod
+    def _peek_left(queue: Any) -> torch.Tensor | None:
+        if not queue:
+            return None
+        if isinstance(queue, list):
+            return queue[0]
+        if hasattr(queue, "__getitem__"):
+            return queue[0]
+        return None
+
+    @staticmethod
+    def _combine_feedback_with_next_text(
         *,
-        feedback: torch.Tensor | None,
-        step_index: int | None,
-        trailing: Any,
-        tts_pad_embed: Any,
-        thinker_chunks_done: bool,
+        data: Any,
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor | None:
+        pending_feedback_queue = getattr(data, "pending_feedback_queue", None)
+        feedback = QwenTalkerModelRunner._peek_left(pending_feedback_queue)
         if feedback is None:
             return None
 
         combined = feedback.to(device=device, dtype=dtype).reshape(-1)
-        index = max(int(step_index or 0), 0)
-
-        trailing_value = None
-        if isinstance(trailing, list) and index < len(trailing):
-            trailing_value = trailing[index]
-        elif isinstance(trailing, torch.Tensor) and index < trailing.shape[0]:
-            trailing_value = trailing[index]
-
-        if trailing_value is not None:
-            combined = combined + trailing_value.to(
+        next_text = QwenTalkerModelRunner._peek_left(
+            getattr(data, "pending_text_queue", None)
+        )
+        if next_text is not None:
+            combined = combined + next_text.to(
                 device=device,
                 dtype=dtype,
             ).reshape(-1)
-        elif thinker_chunks_done and tts_pad_embed is not None:
-            combined = combined + tts_pad_embed.to(
+        elif (
+            bool(getattr(data, "thinker_chunks_done", False))
+            and getattr(data, "tts_pad_embed", None) is not None
+        ):
+            combined = combined + data.tts_pad_embed.to(
                 device=device,
                 dtype=dtype,
             ).reshape(-1)
@@ -241,62 +279,25 @@ class QwenTalkerModelRunner(ModelRunner):
         return combined
 
     @staticmethod
-    def _take_next_ready_feedback_embed(
+    def _take_next_decode_input_embed(
         *,
         sched_req: Any,
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor | None:
         data = sched_req.data
-        feedback_queue = getattr(data, "feedback_queue", None)
-        if feedback_queue:
-            feedback, step_index = feedback_queue[0]
-            combined = QwenTalkerModelRunner._combine_feedback_entry(
-                feedback=feedback,
-                step_index=step_index,
-                trailing=data.trailing_text_hidden,
-                tts_pad_embed=data.tts_pad_embed,
-                thinker_chunks_done=bool(data.thinker_chunks_done),
-                device=device,
-                dtype=dtype,
-            )
-            if combined is None:
-                return None
-            feedback_queue.popleft()
-            if feedback_queue:
-                data.feedback_embeds, data.feedback_step_index = feedback_queue[0]
-            else:
-                data.feedback_embeds = None
-                data.feedback_step_index = None
-            return combined
-
-        combined = QwenTalkerModelRunner._combine_feedback_embed(
-            sched_req=sched_req,
+        combined = QwenTalkerModelRunner._combine_feedback_with_next_text(
+            data=data,
             device=device,
             dtype=dtype,
         )
-        if combined is not None:
-            data.feedback_embeds = None
-            data.feedback_step_index = None
+        if combined is None:
+            return None
+
+        QwenTalkerModelRunner._pop_left(getattr(data, "pending_feedback_queue", None))
+        if getattr(data, "pending_text_queue", None):
+            QwenTalkerModelRunner._pop_left(data.pending_text_queue)
         return combined
-
-    @staticmethod
-    def _combine_feedback_embed(
-        *,
-        sched_req: Any,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor | None:
-        data = sched_req.data
-        return QwenTalkerModelRunner._combine_feedback_entry(
-            feedback=data.feedback_embeds,
-            step_index=data.feedback_step_index,
-            trailing=data.trailing_text_hidden,
-            tts_pad_embed=data.tts_pad_embed,
-            thinker_chunks_done=bool(data.thinker_chunks_done),
-            device=device,
-            dtype=dtype,
-        )
 
     def _forward_with_input_embeds(
         self,

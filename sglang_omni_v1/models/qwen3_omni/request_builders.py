@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import collections
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -314,7 +316,9 @@ def build_sglang_talker_request(
     talker_input_embeds: torch.Tensor | None = None,
     talker_input_ids: torch.Tensor | list[int] | None = None,
     input_embeds_are_projected: bool = False,
-    trailing_text_hidden: list[torch.Tensor] | torch.Tensor | None = None,
+    pending_text_queue: (
+        collections.deque[torch.Tensor] | list[torch.Tensor] | torch.Tensor | None
+    ) = None,
     tts_pad_embed: torch.Tensor | None = None,
     thinker_chunks_done: bool = True,
     thinker_config: Any = None,
@@ -324,7 +328,8 @@ def build_sglang_talker_request(
 
     Stores thinker hidden states as Req.input_embeds so SGLang's pipeline
     passes them through ForwardBatch.input_embeds -> model.forward(input_embeds=...).
-    Uses dummy input_ids of matching length for position tracking.
+    Uses dummy input_ids of matching length for position tracking, while the
+    host-side request data keeps a FIFO queue of future text rows for decode.
 
     Args:
         thinker_hidden_states: Embed layer hidden states [seq_len, hidden_size].
@@ -421,14 +426,15 @@ def build_sglang_talker_request(
     )
     data.suppress_tokens = list(req._codec_suppress_tokens or [])
     data.talker_model_inputs = dict(talker_model_inputs or {})
-    data.feedback_embeds = None
     if thinker_layer_hidden is not None:
         data.extra_model_outputs["thinker_layer_hidden"] = thinker_layer_hidden
     if multimodal_mask is not None:
         data.extra_model_outputs["talker_multimodal_mask"] = multimodal_mask
     data.input_embeds_are_projected = bool(input_embeds_are_projected)
     data.thinker_chunks_done = bool(thinker_chunks_done)
-    data.trailing_text_hidden = trailing_text_hidden
+    if isinstance(pending_text_queue, torch.Tensor):
+        pending_text_queue = [row.detach().cpu() for row in pending_text_queue]
+    data.pending_text_queue = collections.deque(pending_text_queue or [])
     data.tts_pad_embed = tts_pad_embed
     return data
 
@@ -610,6 +616,29 @@ def make_talker_scheduler_adapters(
         speaker_map=speaker_map,
     )
 
+    def _fallback_thinker_chunks_from_state(payload: StagePayload) -> list[Any]:
+        state = PipelineState.from_dict(payload.data)
+        thinker_out = state.thinker_out or state.engine_outputs.get("thinker")
+        if not isinstance(thinker_out, dict):
+            return []
+
+        output_ids = thinker_out.get("output_ids")
+        if not isinstance(output_ids, list) or not output_ids:
+            return []
+
+        token_ids = torch.tensor(
+            [int(token_id) for token_id in output_ids],
+            dtype=torch.long,
+        )
+        token_embeds = prefill_builder._load_prompt_token_embeddings(token_ids)
+        return [
+            SimpleNamespace(
+                data=row.detach().cpu(),
+                metadata={"token_id": int(token_id)},
+            )
+            for token_id, row in zip(token_ids.tolist(), token_embeds)
+        ]
+
     def _resolve_talker_sampling_config(params: dict[str, Any]) -> dict[str, Any]:
         codec_eos_id = int(getattr(model.config, "codec_eos_token_id", -1))
         suppress_tokens = [
@@ -633,18 +662,21 @@ def make_talker_scheduler_adapters(
         thinker_chunks = list(payload.prefetched_chunks)
         thinker_done = bool(payload.prefetched_stream_done)
 
-        if not thinker_chunks:
-            raise ValueError(
-                "talker request_builder requires thinker stream chunks; "
-                "direct thinker_out fallback has been removed"
+        if not thinker_done:
+            raise RuntimeError(
+                "QwenTalkerScheduler called talker request_builder before thinker "
+                "stream completion"
             )
 
-        prompt_chunks = thinker_chunks[:1]
-        buffered_chunks = thinker_chunks[1:]
+        if not thinker_chunks:
+            thinker_chunks = _fallback_thinker_chunks_from_state(payload)
+        if not thinker_chunks:
+            raise ValueError("talker request_builder requires thinker output tokens")
+
         prompt_prefill = prefill_builder.build_prompt_prefill(
             payload,
-            prompt_chunks,
-            thinker_done=False,
+            thinker_chunks,
+            thinker_done=True,
         )
         req_data = build_sglang_talker_request(
             thinker_hidden_states=torch.empty(0),
@@ -665,20 +697,13 @@ def make_talker_scheduler_adapters(
             talker_input_embeds=prompt_prefill["input_embeds"],
             talker_input_ids=prompt_prefill["input_ids"],
             input_embeds_are_projected=True,
-            trailing_text_hidden=prompt_prefill["trailing_text_hidden"],
+            pending_text_queue=prompt_prefill["pending_text_queue"],
             tts_pad_embed=prompt_prefill["tts_pad_embed"],
-            thinker_chunks_done=False,
+            thinker_chunks_done=True,
             thinker_config=thinker_config,
             talker_model_inputs=prompt_prefill["prompt_model_inputs"],
         )
         req_data.tts_eos_embed = prompt_prefill["tts_eos_embed"]
-        req_data.thinker_stream_chunks = list(prompt_chunks)
-        for chunk in buffered_chunks:
-            prefill_builder.append_trailing_chunk(req_data, chunk)
-        if thinker_done:
-            prefill_builder.mark_thinker_done(req_data)
-        payload.prefetched_chunks = []
-        payload.prefetched_stream_done = False
         req_data.stage_payload = payload
         return req_data
 
@@ -693,6 +718,6 @@ def make_talker_scheduler_adapters(
     return (
         request_builder,
         result_adapter,
-        prefill_builder.append_trailing_chunk,
+        prefill_builder.append_text_chunk,
         prefill_builder.mark_thinker_done,
     )

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import collections
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -29,11 +30,8 @@ class SGLangARRequestData:
     input_embeds_are_projected: bool = False
     stage_payload: Any = None
     talker_model_inputs: dict[str, Any] = field(default_factory=dict)
-    feedback_embeds: Any = None
-    feedback_step_index: int | None = None
-    feedback_queue: Any = None
-    trailing_text_hidden: Any = None
+    pending_feedback_queue: Any = field(default_factory=collections.deque)
+    pending_text_queue: Any = field(default_factory=collections.deque)
     tts_pad_embed: Any = None
     tts_eos_embed: Any = None
     thinker_chunks_done: bool = True
-    thinker_stream_chunks: list[Any] | None = None

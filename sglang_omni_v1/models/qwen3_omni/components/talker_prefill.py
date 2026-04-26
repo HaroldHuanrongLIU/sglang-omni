@@ -1,8 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Prompt-aware talker prefill helpers."""
+"""Prompt-aware talker prefill helpers.
+
+This module mirrors HF's talker prefill layout, then converts HF's
+``trailing_text_hidden`` tensor into a host-side FIFO queue of future text rows.
+"""
 
 from __future__ import annotations
 
+import collections
 import json
 from pathlib import Path
 from typing import Any
@@ -230,21 +235,16 @@ class TalkerPrefillBuilder:
         return {
             "input_embeds": prefill["input_embeds"],
             "input_ids": prefill["input_ids"],
-            "trailing_text_hidden": self.tensor_rows_to_list(
-                prefill["trailing_text_hidden"]
+            "pending_text_queue": self.tensor_rows_to_queue(
+                prefill["future_text_rows"]
             ),
             "tts_pad_embed": tts_pad_embed[0].detach().cpu(),
             "tts_eos_embed": tts_eos_embed[0].detach().cpu(),
             "prompt_model_inputs": prompt_model_inputs,
         }
 
-    def append_trailing_chunk(self, req_data: Any, chunk: Any) -> None:
-        if req_data.thinker_stream_chunks is None:
-            req_data.thinker_stream_chunks = []
-        req_data.thinker_stream_chunks.append(chunk)
-
-        trailing = req_data.trailing_text_hidden
-        if not isinstance(trailing, list):
+    def append_text_chunk(self, req_data: Any, chunk: Any) -> None:
+        if getattr(req_data, "thinker_chunks_done", False):
             return
 
         metadata = chunk.metadata or {}
@@ -252,18 +252,26 @@ class TalkerPrefillBuilder:
         if token_id is not None and int(token_id) == self._im_end_token_id:
             return
 
-        trailing.append(self.project_assistant_chunk(chunk).cpu())
+        pending_text_queue = getattr(req_data, "pending_text_queue", None)
+        if pending_text_queue is None:
+            pending_text_queue = collections.deque()
+            req_data.pending_text_queue = pending_text_queue
+        pending_text_queue.append(self.project_assistant_chunk(chunk).cpu())
 
     def mark_thinker_done(self, req_data: Any) -> None:
         if req_data.thinker_chunks_done:
             return
 
         req_data.thinker_chunks_done = True
-        trailing = req_data.trailing_text_hidden
-        if isinstance(trailing, list) and isinstance(
-            req_data.tts_eos_embed, torch.Tensor
-        ):
-            trailing.append(req_data.tts_eos_embed.detach().cpu())
+        pending_text_queue = getattr(req_data, "pending_text_queue", None)
+        if pending_text_queue is None:
+            pending_text_queue = collections.deque()
+            req_data.pending_text_queue = pending_text_queue
+        if isinstance(
+            pending_text_queue,
+            collections.deque,
+        ) and isinstance(req_data.tts_eos_embed, torch.Tensor):
+            pending_text_queue.append(req_data.tts_eos_embed.detach().cpu())
 
     def extract_chunk_token_ids(self, thinker_chunks: list[Any]) -> torch.Tensor:
         token_ids = []
@@ -319,10 +327,15 @@ class TalkerPrefillBuilder:
             self._tts_special_cache = projected.chunk(3, dim=0)
         return self._tts_special_cache
 
-    def tensor_rows_to_list(self, tensor: torch.Tensor | None) -> list[torch.Tensor]:
+    def tensor_rows_to_queue(
+        self, tensor: torch.Tensor | None
+    ) -> collections.deque[torch.Tensor]:
+        queue: collections.deque[torch.Tensor] = collections.deque()
         if not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
-            return []
-        return [row.detach().cpu() for row in tensor]
+            return queue
+        for row in tensor:
+            queue.append(row.detach().cpu())
+        return queue
 
     def _reconstruct_prompt_states(
         self, state: PipelineState

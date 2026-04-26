@@ -536,7 +536,7 @@ def create_sglang_thinker_executor_from_config(
     speech_enabled: bool = False,
 ):
     """Returns OmniScheduler for thinker."""
-    from sglang_omni_v1.scheduling.factory import create_thinker_scheduler
+    from sglang_omni_v1.models.qwen3_omni.bootstrap import create_thinker_scheduler
 
     overrides = {"disable_cuda_graph": True}
     if server_args_overrides:
@@ -564,7 +564,7 @@ def create_talker_ar_executor_from_config(
     weight_prefix: str = "talker.",
 ):
     """Returns OmniScheduler for talker."""
-    from sglang_omni_v1.scheduling.factory import create_talker_scheduler
+    from sglang_omni_v1.models.qwen3_omni.bootstrap import create_talker_scheduler
 
     overrides = {"disable_cuda_graph": True}
     if server_args_overrides:

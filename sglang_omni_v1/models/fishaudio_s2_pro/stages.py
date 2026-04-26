@@ -174,7 +174,7 @@ def create_sglang_tts_engine_executor(
     from sglang_omni_v1.models.fishaudio_s2_pro.fish_scheduler import FishScheduler
     from sglang_omni_v1.models.fishaudio_s2_pro.model_runner import FishS2ProModelRunner
     from sglang_omni_v1.models.fishaudio_s2_pro.tokenizer import S2ProTokenizerAdapter
-    from sglang_omni_v1.scheduling.factory import _create_sglang_infrastructure
+    from sglang_omni_v1.scheduling.bootstrap import create_sglang_infrastructure
     from sglang_omni_v1.scheduling.sglang_backend import (
         SGLangOutputProcessor,
         build_sglang_server_args,
@@ -217,7 +217,7 @@ def create_sglang_tts_engine_executor(
         prefill_mgr,
         decode_mgr,
         model_config,
-    ) = _create_sglang_infrastructure(server_args, gpu_id)
+    ) = create_sglang_infrastructure(server_args, gpu_id)
 
     if want_cuda_graph:
         server_args.disable_cuda_graph = False

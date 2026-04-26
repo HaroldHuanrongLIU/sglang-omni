@@ -332,6 +332,12 @@ class OmniScheduler:
     # Overridden methods (take precedence over __getattr__)
     # ------------------------------------------------------------------
 
+    def get_next_batch_to_run(self):
+        batch = _Upstream.get_next_batch_to_run(self)
+        if batch is not None and not self._is_batch_ready_to_run(batch):
+            return None
+        return batch
+
     def recv_requests(self):
         """Drain inbox and return new-request payloads."""
         new_reqs: list = []
@@ -357,46 +363,32 @@ class OmniScheduler:
         """Convert incoming payloads to SGLang Reqs and enqueue."""
         for payload in recv_reqs:
             req_id = payload.request_id
-            payload.prefetched_chunks = self._pending_stream_chunks.pop(req_id, [])
+            buffered_chunks = self._pending_stream_chunks.pop(req_id, [])
+            existing_chunks = list(getattr(payload, "prefetched_chunks", []) or [])
+            if existing_chunks:
+                existing_chunks.extend(buffered_chunks)
+                payload.prefetched_chunks = existing_chunks
+            else:
+                payload.prefetched_chunks = buffered_chunks
             pending_stream_done = req_id in self._pending_stream_done
             payload.prefetched_stream_done = pending_stream_done
-            try:
-                req_data = self._request_builder(payload)
-            except ValueError as exc:
-                if self._should_defer_request_build(payload, pending_stream_done, exc):
-                    self._deferred_request_payloads[req_id] = payload
-                    continue
-                raise
+            if not self._is_request_build_ready(
+                payload,
+                pending_stream_done=pending_stream_done,
+            ):
+                self._deferred_request_payloads[req_id] = payload
+                continue
+            req_data = self._request_builder(payload)
             if pending_stream_done:
                 self._pending_stream_done.discard(req_id)
             self._deferred_request_payloads.pop(req_id, None)
             req = req_data.req
             req._omni_data = req_data
             req_id = req.rid
-            for chunk in payload.prefetched_chunks:
-                self._append_stream_chunk(req_data, chunk)
-            if payload.prefetched_stream_done:
-                self._mark_stream_done(req_data)
+            self._initialize_request_stream_state(req_data, payload)
             if req_id in self._aborted_request_ids:
                 continue
             self.waiting_queue.append(req)
-
-    @staticmethod
-    def _should_defer_request_build(
-        payload: Any,
-        pending_stream_done: bool,
-        exc: ValueError,
-    ) -> bool:
-        if pending_stream_done:
-            return False
-        prefetched_chunks = payload.prefetched_chunks or []
-        if prefetched_chunks:
-            return False
-        message = str(exc)
-        return (
-            "requires thinker stream chunks" in message
-            or "prompt prefill requires thinker chunks" in message
-        )
 
     def _take_deferred_request_payloads(self) -> list[Any]:
         if not self._deferred_request_payloads:
@@ -404,6 +396,25 @@ class OmniScheduler:
         deferred = list(self._deferred_request_payloads.values())
         self._deferred_request_payloads.clear()
         return deferred
+
+    def _is_request_build_ready(
+        self,
+        payload: Any,
+        *,
+        pending_stream_done: bool,
+    ) -> bool:
+        del payload, pending_stream_done
+        return True
+
+    def _initialize_request_stream_state(self, req_data: Any, payload: Any) -> None:
+        for chunk in getattr(payload, "prefetched_chunks", []) or []:
+            self._append_stream_chunk(req_data, chunk)
+        if bool(getattr(payload, "prefetched_stream_done", False)):
+            self._mark_stream_done(req_data)
+
+    def _is_batch_ready_to_run(self, batch: Any) -> bool:
+        del batch
+        return True
 
     def run_batch(self, batch, pp_proxy_tensors=None):
         """Run a batch through the model runner.
@@ -627,19 +638,11 @@ class OmniScheduler:
 
     @staticmethod
     def _append_stream_chunk_default(req_data: Any, chunk: Any) -> None:
-        trailing = getattr(req_data, "trailing_text_hidden", None)
-        if trailing is None:
-            trailing = []
-            req_data.trailing_text_hidden = trailing
-        if isinstance(trailing, list):
-            trailing.append(getattr(chunk, "data", chunk))
-
-        thinker_stream_chunks = getattr(req_data, "thinker_stream_chunks", None)
-        if thinker_stream_chunks is None:
-            thinker_stream_chunks = []
-            req_data.thinker_stream_chunks = thinker_stream_chunks
-        if isinstance(thinker_stream_chunks, list):
-            thinker_stream_chunks.append(chunk)
+        stream_chunks = getattr(req_data, "stream_chunks", None)
+        if stream_chunks is None:
+            stream_chunks = deque()
+            req_data.stream_chunks = stream_chunks
+        stream_chunks.append(chunk)
 
     def _append_stream_chunk(self, req_data: Any, chunk: Any) -> None:
         if self._stream_chunk_handler is None:
@@ -649,7 +652,7 @@ class OmniScheduler:
 
     def _mark_stream_done(self, req_data: Any) -> None:
         if self._stream_done_handler is None:
-            req_data.thinker_chunks_done = True
+            req_data.stream_done = True
             return
         self._stream_done_handler(req_data)
 
