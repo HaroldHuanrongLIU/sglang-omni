@@ -11,6 +11,8 @@ def create_thinker_scheduler(
     gpu_id: int = 0,
     *,
     speech_enabled: bool = False,
+    tp_rank: int = 0,
+    nccl_port: int | None = None,
 ):
     """Create the Qwen thinker scheduler."""
     from sglang.srt.utils.hf_transformers_utils import get_tokenizer
@@ -42,6 +44,8 @@ def create_thinker_scheduler(
     ) = create_sglang_infrastructure(
         server_args,
         gpu_id,
+        tp_rank=tp_rank,
+        nccl_port=nccl_port,
         capture_hidden_layers=capture_hidden_layers,
     )
 
@@ -92,6 +96,8 @@ def create_talker_scheduler(
     weight_prefix: str = "talker.",
     speech_enabled: bool = True,
     feedback_enabled: bool = True,
+    tp_rank: int = 0,
+    nccl_port: int | None = None,
 ):
     """Create the Qwen talker scheduler."""
     del speech_enabled
@@ -126,6 +132,8 @@ def create_talker_scheduler(
     ) = create_sglang_infrastructure(
         server_args,
         gpu_id,
+        tp_rank=tp_rank,
+        nccl_port=nccl_port,
         model_arch_override="Qwen3OmniTalker",
         weight_prefix=weight_prefix,
     )

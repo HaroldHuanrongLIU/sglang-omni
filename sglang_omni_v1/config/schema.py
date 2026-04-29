@@ -97,10 +97,6 @@ class PipelineConfig(BaseModel):
         self._validate_fusion()
         self.config_cls = self.__class__.__name__
 
-    # ------------------------------------------------------------------
-    # Derived properties
-    # ------------------------------------------------------------------
-
     @property
     def resolved_entry_stage(self) -> str:
         if self.entry_stage is not None:
@@ -118,10 +114,6 @@ class PipelineConfig(BaseModel):
             if s.gpu is not None:
                 out[s.name] = s.gpu
         return out
-
-    # ------------------------------------------------------------------
-    # Validation
-    # ------------------------------------------------------------------
 
     def _validate_general(self) -> None:
         if not self.model_path:

@@ -5,13 +5,7 @@ Spawns each pipeline stage (possibly with multiple TP ranks) in its own OS
 process(es).  The main process runs only the Coordinator.
 
 Architecture
-------------
 ``PipelineConfig`` → ``_build_stage_groups()`` → ``list[StageGroup]``
-
-Each :class:`StageGroup` holds *tp_size* :class:`StageProcessSpec` objects
-(one per TP rank) and manages the corresponding OS processes.  The
-:class:`MultiProcessPipelineRunner` orchestrates startup, monitoring, and
-shutdown across all groups.
 """
 from __future__ import annotations
 
@@ -35,23 +29,23 @@ from sglang_omni_v1.pipeline.stage_process import StageProcessSpec
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Spec builder — turns PipelineConfig into a list of StageGroups
-# ---------------------------------------------------------------------------
-
-
-def _build_stage_groups(config: PipelineConfig) -> list[StageGroup]:
+def _build_stage_groups(
+    config: PipelineConfig,
+    ctx: multiprocessing.context.BaseContext | None = None,
+) -> list[StageGroup]:
     """Compile *config* into one :class:`StageGroup` per logical stage.
 
     This runs in the **main process** so that subprocesses never need to
     re-compile the pipeline configuration.
     """
+    if ctx is None:
+        ctx = multiprocessing.get_context("spawn")
+
     stages_cfg, name_map, _ = config.apply_fusion()
     endpoints = _allocate_endpoints(config, stages=stages_cfg)
     stage_endpoints = {s.name: endpoints[f"stage_{s.name}"] for s in stages_cfg}
     cfg_map = {s.name: s for s in stages_cfg}
 
-    # Pre-compute which stages receive streams
     stream_receivers: set[str] = set()
     for scfg in stages_cfg:
         for target in scfg.stream_to:
@@ -78,54 +72,47 @@ def _build_stage_groups(config: PipelineConfig) -> list[StageGroup]:
         # Pre-resolve factory args (inject model_path, gpu_id)
         base_factory_args = _resolve_factory_args(stage_cfg, config)
 
-        specs: list[StageProcessSpec] = []
-        for tp_rank in range(tp_size):
-            gpu_id = gpu_ids[tp_rank] if tp_rank < len(gpu_ids) else gpu_ids[0]
-
-            # Per-rank factory args: override gpu_id and inject tp_rank/tp_size
-            factory_args = dict(base_factory_args)
-            if "gpu_id" in base_factory_args:
-                factory_args["gpu_id"] = gpu_id
-            if tp_size > 1:
-                factory_args["tp_rank"] = tp_rank
-                factory_args["tp_size"] = tp_size
-
-            # Per-rank relay config
-            relay_config = _resolve_relay_config(stage_cfg, config, gpu_id=gpu_id)
-
-            specs.append(
-                StageProcessSpec(
-                    stage_name=stage_cfg.name,
-                    tp_rank=tp_rank,
-                    tp_size=tp_size,
-                    gpu_id=gpu_id,
-                    nccl_port=nccl_port,
-                    factory=stage_cfg.factory,
-                    factory_args=factory_args,
-                    next_stages=stage_cfg.next,
-                    is_terminal=stage_cfg.terminal,
-                    wait_for=stage_cfg.wait_for,
-                    merge_fn=stage_cfg.merge_fn,
-                    relay_config=relay_config,
+        stage_kwargs = dict(
+            stage_name=stage_cfg.name,
+            factory=stage_cfg.factory,
+            next_stages=stage_cfg.next,
+            is_terminal=stage_cfg.terminal,
+            wait_for=stage_cfg.wait_for,
+            merge_fn=stage_cfg.merge_fn,
+            coordinator_endpoint=endpoints["completion"],
+            abort_endpoint=endpoints["abort"],
+            stage_endpoints=stage_endpoints,
+            stream_targets=list(stage_cfg.stream_to),
+            same_gpu_targets=same_gpu_targets,
+            is_stream_receiver=stage_cfg.name in stream_receivers,
+            name_map=name_map,
+        )
+        if tp_size == 1:
+            specs = [
+                _build_single_stage_spec(
+                    stage_cfg=stage_cfg,
+                    config=config,
+                    gpu_id=gpu_ids[0],
                     recv_endpoint=stage_endpoints[stage_cfg.name],
-                    coordinator_endpoint=endpoints["completion"],
-                    abort_endpoint=endpoints["abort"],
-                    stage_endpoints=stage_endpoints,
-                    stream_targets=list(stage_cfg.stream_to),
-                    same_gpu_targets=same_gpu_targets,
-                    is_stream_receiver=stage_cfg.name in stream_receivers,
-                    name_map=name_map,
+                    base_factory_args=base_factory_args,
+                    stage_kwargs=stage_kwargs,
                 )
+            ]
+        else:
+            specs = _build_tp_stage_specs(
+                ctx=ctx,
+                stage_cfg=stage_cfg,
+                config=config,
+                gpu_ids=gpu_ids,
+                nccl_port=nccl_port,
+                recv_endpoint=stage_endpoints[stage_cfg.name],
+                base_factory_args=base_factory_args,
+                stage_kwargs=stage_kwargs,
             )
 
         groups.append(StageGroup(stage_cfg.name, specs))
 
     return groups
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 
 def _resolve_gpu_ids(stage_cfg: StageConfig, config: PipelineConfig) -> list[int]:
@@ -165,6 +152,96 @@ def _resolve_factory_args(
     return args
 
 
+def _build_single_stage_spec(
+    *,
+    stage_cfg: StageConfig,
+    config: PipelineConfig,
+    gpu_id: int,
+    recv_endpoint: str,
+    base_factory_args: dict[str, Any],
+    stage_kwargs: dict[str, Any],
+) -> StageProcessSpec:
+    factory_args = dict(base_factory_args)
+    if "gpu_id" in base_factory_args:
+        factory_args["gpu_id"] = gpu_id
+    relay_config = _resolve_relay_config(stage_cfg, config, gpu_id=gpu_id)
+    return StageProcessSpec(
+        role="single",
+        tp_rank=0,
+        tp_size=1,
+        gpu_id=gpu_id,
+        nccl_port=None,
+        factory_args=factory_args,
+        relay_config=relay_config,
+        recv_endpoint=recv_endpoint,
+        **stage_kwargs,
+    )
+
+
+def _build_tp_stage_specs(
+    *,
+    ctx: multiprocessing.context.BaseContext,
+    stage_cfg: StageConfig,
+    config: PipelineConfig,
+    gpu_ids: list[int],
+    nccl_port: int | None,
+    recv_endpoint: str,
+    base_factory_args: dict[str, Any],
+    stage_kwargs: dict[str, Any],
+) -> list[StageProcessSpec]:
+    follower_work_queues = [ctx.Queue() for _ in range(stage_cfg.tp_size - 1)]
+    follower_abort_queues = [ctx.Queue() for _ in range(stage_cfg.tp_size - 1)]
+    specs: list[StageProcessSpec] = []
+
+    for tp_rank in range(stage_cfg.tp_size):
+        gpu_id = gpu_ids[tp_rank] if tp_rank < len(gpu_ids) else gpu_ids[0]
+        factory_args = dict(base_factory_args)
+        if "gpu_id" in base_factory_args:
+            factory_args["gpu_id"] = gpu_id
+        factory_args["tp_rank"] = tp_rank
+        factory_args["tp_size"] = stage_cfg.tp_size
+        factory_args["nccl_port"] = nccl_port
+
+        relay_config = _resolve_relay_config(stage_cfg, config, gpu_id=gpu_id)
+
+        if tp_rank == 0:
+            specs.append(
+                StageProcessSpec(
+                    role="leader",
+                    tp_rank=tp_rank,
+                    tp_size=stage_cfg.tp_size,
+                    gpu_id=gpu_id,
+                    nccl_port=nccl_port,
+                    factory_args=factory_args,
+                    relay_config=relay_config,
+                    recv_endpoint=recv_endpoint,
+                    follower_work_queues=follower_work_queues,
+                    follower_abort_queues=follower_abort_queues,
+                    **stage_kwargs,
+                )
+            )
+            continue
+
+        idx = tp_rank - 1
+        specs.append(
+            StageProcessSpec(
+                role="follower",
+                tp_rank=tp_rank,
+                tp_size=stage_cfg.tp_size,
+                gpu_id=gpu_id,
+                nccl_port=nccl_port,
+                factory_args=factory_args,
+                relay_config=relay_config,
+                recv_endpoint="",
+                internal_work_queue=follower_work_queues[idx],
+                internal_abort_queue=follower_abort_queues[idx],
+                **stage_kwargs,
+            )
+        )
+
+    return specs
+
+
 def _resolve_relay_config(
     stage_cfg: StageConfig,
     config: PipelineConfig,
@@ -198,18 +275,7 @@ class _NcclPortAllocator:
                 continue
 
 
-# ---------------------------------------------------------------------------
-# MultiProcessPipelineRunner  (public API — kept compatible)
-# ---------------------------------------------------------------------------
-
-
 class MultiProcessPipelineRunner:
-    """Run each pipeline stage in its own OS process(es).
-
-    Main process runs only the Coordinator.  Each logical stage is backed
-    by a :class:`StageGroup` that may contain multiple processes when
-    ``tp_size > 1``.
-    """
 
     def __init__(self, config: PipelineConfig):
         self._config = config
@@ -225,18 +291,14 @@ class MultiProcessPipelineRunner:
             raise RuntimeError("Runner not started")
         return self._coordinator
 
-    # ------------------------------------------------------------------
-    # Start
-    # ------------------------------------------------------------------
-
     async def start(self, timeout: float = 120.0) -> None:
         if self._started:
             raise RuntimeError("Already started")
 
         try:
-            groups = _build_stage_groups(self._config)
+            ctx = multiprocessing.get_context("spawn")
+            groups = _build_stage_groups(self._config, ctx)
 
-            # Coordinator
             stages_cfg, _, entry_stage = self._config.apply_fusion()
             endpoints = _allocate_endpoints(self._config, stages=stages_cfg)
 
@@ -251,16 +313,12 @@ class MultiProcessPipelineRunner:
                 self._coordinator.run_completion_loop()
             )
 
-            # Spawn all stage groups
-            ctx = multiprocessing.get_context("spawn")
             for group in groups:
                 group.spawn(ctx)
             self._groups = groups
 
-            # Wait for all groups to be ready
             await asyncio.gather(*(g.wait_ready(timeout) for g in self._groups))
 
-            # Verify no early deaths
             for group in self._groups:
                 if group.any_dead():
                     raise RuntimeError(
@@ -268,7 +326,6 @@ class MultiProcessPipelineRunner:
                         f"{group.dead_summary()}"
                     )
 
-            # Register stages (coordinator talks to rank 0 of each group)
             for group in self._groups:
                 self._coordinator.register_stage(
                     group.stage_name, group.leader_endpoint
@@ -288,10 +345,6 @@ class MultiProcessPipelineRunner:
             await self._cleanup_on_failure()
             raise
 
-    # ------------------------------------------------------------------
-    # Monitor
-    # ------------------------------------------------------------------
-
     async def _monitor_children(self) -> None:
         while self._started:
             for group in self._groups:
@@ -303,10 +356,6 @@ class MultiProcessPipelineRunner:
                     await self.stop()
                     return
             await asyncio.sleep(5.0)
-
-    # ------------------------------------------------------------------
-    # Stop
-    # ------------------------------------------------------------------
 
     async def stop(self) -> None:
         if not self._started:
@@ -340,10 +389,6 @@ class MultiProcessPipelineRunner:
 
         await self._coordinator.stop()
         self._groups.clear()
-
-    # ------------------------------------------------------------------
-    # Internal cleanup
-    # ------------------------------------------------------------------
 
     async def _cleanup_on_failure(self) -> None:
         """Best-effort cleanup after a failed start()."""

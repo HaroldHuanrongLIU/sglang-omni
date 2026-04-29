@@ -23,13 +23,12 @@ def _normalize_stage_toggle_mode(flag_name: str, value: str) -> _STAGE_TOGGLE_MO
     return normalized  # type: ignore[return-value]
 
 
-def _apply_stage_server_args_override(
+def _find_matching_stages(
     pipeline_config: PipelineConfig,
     *,
     stage_name: str,
-    updates: dict[str, object],
     reason: str,
-) -> None:
+):
     matching_stages = [
         stage for stage in pipeline_config.stages if stage.name == stage_name
     ]
@@ -37,13 +36,157 @@ def _apply_stage_server_args_override(
         raise typer.BadParameter(
             f"Stage {stage_name!r} not found in pipeline; cannot set {reason}"
         )
+    return matching_stages
 
+
+def _apply_stage_server_args_override(
+    pipeline_config: PipelineConfig,
+    *,
+    stage_name: str,
+    updates: dict[str, object],
+    reason: str,
+) -> None:
+    matching_stages = _find_matching_stages(
+        pipeline_config,
+        stage_name=stage_name,
+        reason=reason,
+    )
     for stage in matching_stages:
         factory_args = dict(stage.factory_args or {})
         overrides = dict(factory_args.get("server_args_overrides") or {})
         overrides.update(updates)
         factory_args["server_args_overrides"] = overrides
         stage.factory_args = factory_args
+
+
+def _parse_gpu_placement(flag_name: str, value: str) -> int | list[int]:
+    text = value.strip()
+    if not text:
+        raise typer.BadParameter(f"{flag_name} must not be empty")
+
+    if text.startswith("["):
+        try:
+            parsed = yaml.safe_load(text)
+        except yaml.YAMLError as exc:
+            raise typer.BadParameter(
+                f"{flag_name} must be an int or list of ints"
+            ) from exc
+    elif "," in text:
+        parsed = [part.strip() for part in text.split(",")]
+    else:
+        try:
+            gpu = int(text)
+        except ValueError as exc:
+            raise typer.BadParameter(
+                f"{flag_name} must be an int or list of ints"
+            ) from exc
+        if gpu < 0:
+            raise typer.BadParameter(f"{flag_name} GPU ids must be >= 0")
+        return gpu
+
+    if not isinstance(parsed, list) or not parsed:
+        raise typer.BadParameter(f"{flag_name} must be an int or non-empty list")
+
+    gpus: list[int] = []
+    for item in parsed:
+        if isinstance(item, int):
+            gpu = item
+        elif isinstance(item, str):
+            try:
+                gpu = int(item.strip())
+            except ValueError as exc:
+                raise typer.BadParameter(
+                    f"{flag_name} must contain only integer GPU ids"
+                ) from exc
+        else:
+            raise typer.BadParameter(f"{flag_name} must contain only integer GPU ids")
+        if gpu < 0:
+            raise typer.BadParameter(f"{flag_name} GPU ids must be >= 0")
+        gpus.append(gpu)
+
+    return gpus[0] if len(gpus) == 1 else gpus
+
+
+def _validate_stage_parallelism_config(stage_name: str, tp_size: int, gpu) -> None:
+    if tp_size < 1:
+        raise typer.BadParameter(f"{stage_name}_tp_size must be >= 1")
+    if tp_size == 1:
+        if isinstance(gpu, list) and len(gpu) != 1:
+            raise typer.BadParameter(
+                f"{stage_name}_gpus must contain exactly 1 GPU id when {stage_name}_tp_size=1"
+            )
+        return
+    if not isinstance(gpu, list):
+        raise typer.BadParameter(
+            f"{stage_name}_gpus must provide one GPU id per TP rank when {stage_name}_tp_size > 1"
+        )
+    if len(gpu) != tp_size:
+        raise typer.BadParameter(
+            f"{stage_name}_gpus must contain exactly {tp_size} GPU ids when {stage_name}_tp_size={tp_size}"
+        )
+    if len(set(gpu)) != len(gpu):
+        raise typer.BadParameter(
+            f"{stage_name}_gpus must not contain duplicate GPU ids"
+        )
+
+
+def _apply_stage_gpu_override(
+    pipeline_config: PipelineConfig,
+    *,
+    stage_name: str,
+    gpu: int | None,
+) -> None:
+    if gpu is None:
+        return
+    if gpu < 0:
+        raise typer.BadParameter(f"{stage_name}_gpu must be >= 0")
+    matching_stages = _find_matching_stages(
+        pipeline_config,
+        stage_name=stage_name,
+        reason=f"GPU placement to {gpu}",
+    )
+    for stage in matching_stages:
+        stage.gpu = int(gpu)
+
+
+def apply_parallelism_cli_overrides(
+    pipeline_config: PipelineConfig,
+    *,
+    thinker_tp_size: int | None,
+    thinker_gpus: str | None,
+    talker_gpu: int | None,
+    code2wav_gpu: int | None,
+) -> PipelineConfig:
+    thinker_gpu_override = (
+        _parse_gpu_placement("thinker_gpus", thinker_gpus)
+        if thinker_gpus is not None
+        else None
+    )
+    thinker_stages = _find_matching_stages(
+        pipeline_config,
+        stage_name="thinker",
+        reason="tensor parallel settings",
+    )
+    for stage in thinker_stages:
+        if thinker_tp_size is not None:
+            stage.tp_size = int(thinker_tp_size)
+        if thinker_gpu_override is not None:
+            stage.gpu = thinker_gpu_override
+        _validate_stage_parallelism_config("thinker", stage.tp_size, stage.gpu)
+        if stage.tp_size == 1 and isinstance(stage.gpu, list):
+            stage.gpu = int(stage.gpu[0])
+
+    _apply_stage_gpu_override(
+        pipeline_config,
+        stage_name="talker_ar",
+        gpu=talker_gpu,
+    )
+    _apply_stage_gpu_override(
+        pipeline_config,
+        stage_name="code2wav",
+        gpu=code2wav_gpu,
+    )
+    return pipeline_config
 
 
 def _apply_stage_cuda_graph_override(
@@ -170,6 +313,38 @@ def serve(
         Literal["debug", "info", "warning", "error", "critical"],
         typer.Option(help="Log level (default: info)."),
     ] = "info",
+    thinker_tp_size: Annotated[
+        int | None,
+        typer.Option(
+            "--thinker-tp-size",
+            "--thinker_tp_size",
+            help="Set tensor parallel size for thinker stage.",
+        ),
+    ] = None,
+    thinker_gpus: Annotated[
+        str | None,
+        typer.Option(
+            "--thinker-gpus",
+            "--thinker_gpus",
+            help="GPU ids for thinker TP ranks, e.g. '0,1' or '[0, 1]'.",
+        ),
+    ] = None,
+    talker_gpu: Annotated[
+        int | None,
+        typer.Option(
+            "--talker-gpu",
+            "--talker_gpu",
+            help="Override GPU id for talker_ar stage.",
+        ),
+    ] = None,
+    code2wav_gpu: Annotated[
+        int | None,
+        typer.Option(
+            "--code2wav-gpu",
+            "--code2wav_gpu",
+            help="Override GPU id for code2wav stage.",
+        ),
+    ] = None,
     thinker_cuda_graph: Annotated[
         str,
         typer.Option(
@@ -240,6 +415,13 @@ def serve(
     extra_args = config_manager.parse_extra_args(ctx.args)
     merged_config = config_manager.merge_config(extra_args)
     merged_config = merged_config.model_copy(update={"model_path": model_path})
+    merged_config = apply_parallelism_cli_overrides(
+        merged_config,
+        thinker_tp_size=thinker_tp_size,
+        thinker_gpus=thinker_gpus,
+        talker_gpu=talker_gpu,
+        code2wav_gpu=code2wav_gpu,
+    )
     merged_config = apply_cuda_graph_cli_overrides(
         merged_config,
         thinker_cuda_graph=thinker_cuda_graph,

@@ -14,16 +14,16 @@ import os
 import queue as _queue_mod
 import threading
 from contextlib import suppress
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 from sglang_omni_v1.pipeline import relay_io
-from sglang_omni_v1.pipeline.control_plane import StageControlPlane
 from sglang_omni_v1.pipeline.stage.input import DirectInput, InputHandler
 from sglang_omni_v1.pipeline.stage.stream_queue import (
     StreamItem,
     StreamQueue,
     StreamSignal,
 )
+from sglang_omni_v1.pipeline.tp_control import TPLeaderFanout
 from sglang_omni_v1.profiler.torch_profiler import TorchProfiler
 from sglang_omni_v1.proto import (
     CompleteMessage,
@@ -54,34 +54,31 @@ class Stage:
     def __init__(
         self,
         name: str,
+        role: Literal["single", "leader", "follower"],
         get_next: GetNextFn,
         gpu_id: int | None,
-        recv_endpoint: str,
-        coordinator_endpoint: str,
-        abort_endpoint: str,
         endpoints: dict[str, str],
+        control_plane: Any,
         input_handler: InputHandler | None = None,
         relay: Relay | None = None,
         relay_config: dict[str, Any] | None = None,
         scheduler: Any = None,
         stream_targets: list[str] | None = None,
         same_gpu_targets: set[str] | None = None,
+        tp_fanout: TPLeaderFanout | None = None,
     ):
         self.name = name
+        self.role = role
         self.get_next = get_next
         self.gpu_id = gpu_id
         self.endpoints = endpoints
+        self.control_plane = control_plane
         self.input_handler = input_handler or DirectInput()
         self.scheduler = scheduler
         self._stream_targets = stream_targets or []
         self._same_gpu_targets = same_gpu_targets or set()
-
-        self.control_plane = StageControlPlane(
-            stage_name=name,
-            recv_endpoint=recv_endpoint,
-            coordinator_endpoint=coordinator_endpoint,
-            abort_endpoint=abort_endpoint,
-        )
+        self._tp_fanout = tp_fanout
+        self._owns_external_io = role in {"single", "leader"}
 
         # --- Relay ---
         if relay is not None:
@@ -119,6 +116,7 @@ class Stage:
         self._scheduler_thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._scheduler_crash_error: BaseException | None = None
+        self._background_task_error: BaseException | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -167,8 +165,11 @@ class Stage:
 
     async def stop(self) -> None:
         self._running = False
-        self.scheduler.stop()
+        if self.scheduler is not None:
+            self.scheduler.stop()
         self.control_plane.close()
+        if self._tp_fanout is not None:
+            self._tp_fanout.close()
         self.relay.close()
         logger.info("Stage %s stopped", self.name)
 
@@ -177,10 +178,25 @@ class Stage:
 
         abort_task = asyncio.create_task(self._abort_listener())
         outbox_task = asyncio.create_task(self._drain_outbox())
+        abort_task.add_done_callback(
+            lambda task: self._on_background_task_done(task, "abort listener")
+        )
+        outbox_task.add_done_callback(
+            lambda task: self._on_background_task_done(task, "outbox drain")
+        )
 
         try:
             while self._running:
                 msg = await self.control_plane.recv()
+                if (
+                    self.role == "leader"
+                    and self._tp_fanout is not None
+                    and isinstance(
+                        msg,
+                        (ShutdownMessage, ProfilerStartMessage, ProfilerStopMessage),
+                    )
+                ):
+                    await self._tp_fanout.fanout_control(msg)
                 if isinstance(msg, ShutdownMessage):
                     break
                 await self._handle_message(msg)
@@ -197,6 +213,8 @@ class Stage:
                 await abort_task
             with suppress(asyncio.CancelledError):
                 await outbox_task
+            if self._background_task_error is not None:
+                raise self._background_task_error
 
     # ------------------------------------------------------------------
     # Message handling
@@ -439,6 +457,12 @@ class Stage:
     # ------------------------------------------------------------------
 
     async def _drain_outbox(self) -> None:
+        if self._owns_external_io:
+            await self._drain_outbox_external()
+        else:
+            await self._drain_outbox_follower()
+
+    async def _drain_outbox_external(self) -> None:
         """Drain scheduler outbox and route results downstream."""
         loop = asyncio.get_running_loop()
         while self._running or not self.scheduler.outbox.empty():
@@ -473,12 +497,35 @@ class Stage:
             elif out.type == "error":
                 await self._send_failure(out.request_id, str(out.data))
 
+    async def _drain_outbox_follower(self) -> None:
+        """Drain follower outbox without emitting external stage traffic."""
+        loop = asyncio.get_running_loop()
+        while self._running or not self.scheduler.outbox.empty():
+            try:
+                out = await loop.run_in_executor(
+                    None, lambda: self.scheduler.outbox.get(timeout=0.1)
+                )
+            except _queue_mod.Empty:
+                continue
+
+            if out.type == "result":
+                self._clear_request_state(out.request_id)
+            elif out.type == "stream":
+                continue
+            elif out.type == "error":
+                raise RuntimeError(
+                    f"TP follower stage {self.name} received scheduler error: {out.data}"
+                )
+
     # ------------------------------------------------------------------
     # Routing: send results to next stage(s) or coordinator
     # ------------------------------------------------------------------
 
     async def _route_result(self, request_id: str, result: Any) -> None:
         """Route a completed result to next stage(s) or complete at coordinator."""
+        if not self._owns_external_io:
+            self._clear_request_state(request_id)
+            return
         # Send stream done to all stream targets
         for target in self._stream_targets:
             endpoint = self.endpoints.get(target)
@@ -512,6 +559,10 @@ class Stage:
         self._clear_request_state(request_id)
 
     async def _send_to_stage(self, request_id: str, target: str, payload: Any) -> None:
+        if not self._owns_external_io:
+            raise RuntimeError(
+                f"Follower stage {self.name} cannot send downstream data"
+            )
         endpoint = self.endpoints.get(target)
         if endpoint is None:
             logger.warning("Stage %s: no endpoint for %s", self.name, target)
@@ -533,6 +584,8 @@ class Stage:
         target: str,
         metadata: dict[str, Any] | None = None,
     ) -> None:
+        if not self._owns_external_io:
+            return
         endpoint = self.endpoints.get(target)
         if endpoint is None:
             return
@@ -553,6 +606,9 @@ class Stage:
         )
 
     async def _send_failure(self, request_id: str, error: str) -> None:
+        if not self._owns_external_io:
+            self._clear_request_state(request_id)
+            raise RuntimeError(f"Follower stage {self.name} failed: {error}")
         await self.control_plane.send_complete(
             CompleteMessage(
                 request_id=request_id,
@@ -579,6 +635,9 @@ class Stage:
         if self._scheduler_crash_error is not None:
             return
         self._scheduler_crash_error = exc
+        if not self._owns_external_io:
+            self.control_plane.close()
+            return
         error = f"scheduler crashed: {exc}"
         active_request_ids = [
             request_id
@@ -601,6 +660,8 @@ class Stage:
         try:
             while self._running:
                 abort_msg = await self.control_plane.recv_abort()
+                if self.role == "leader" and self._tp_fanout is not None:
+                    await self._tp_fanout.fanout_abort(abort_msg)
                 self._on_abort(abort_msg.request_id)
         except asyncio.CancelledError:
             pass
@@ -649,7 +710,25 @@ class Stage:
     # Info
     # ------------------------------------------------------------------
 
+    def _on_background_task_done(self, task: asyncio.Task, label: str) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+        logger.exception(
+            "Stage %s %s task crashed",
+            self.name,
+            label,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+        if self._background_task_error is None:
+            self._background_task_error = exc
+        self._running = False
+        self.control_plane.close()
+
     def info(self) -> StageInfo:
         return StageInfo(
-            name=self.name, control_endpoint=self.control_plane.recv_endpoint
+            name=self.name,
+            control_endpoint=self.control_plane.recv_endpoint,
         )

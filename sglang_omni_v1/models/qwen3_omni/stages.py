@@ -531,6 +531,9 @@ def create_sglang_thinker_executor_from_config(
     model_path: str,
     *,
     gpu_id: int = 0,
+    tp_rank: int = 0,
+    tp_size: int = 1,
+    nccl_port: int | None = None,
     thinker_max_seq_len: int = 8192,
     server_args_overrides: dict[str, Any] | None = None,
     speech_enabled: bool = False,
@@ -541,6 +544,7 @@ def create_sglang_thinker_executor_from_config(
     overrides = {"disable_cuda_graph": True}
     if server_args_overrides:
         overrides.update(server_args_overrides)
+    overrides["tp_size"] = tp_size
     server_args = build_sglang_server_args(
         model_path,
         context_length=thinker_max_seq_len,
@@ -550,6 +554,8 @@ def create_sglang_thinker_executor_from_config(
         server_args,
         gpu_id,
         speech_enabled=speech_enabled,
+        tp_rank=tp_rank,
+        nccl_port=nccl_port,
     )
 
 
@@ -557,6 +563,9 @@ def create_talker_ar_executor_from_config(
     model_path: str,
     *,
     gpu_id: int = 0,
+    tp_rank: int = 0,
+    tp_size: int = 1,
+    nccl_port: int | None = None,
     talker_max_seq_len: int = 4096,
     server_args_overrides: dict[str, Any] | None = None,
     speech_enabled: bool = True,
@@ -569,6 +578,7 @@ def create_talker_ar_executor_from_config(
     overrides = {"disable_cuda_graph": True}
     if server_args_overrides:
         overrides.update(server_args_overrides)
+    overrides["tp_size"] = tp_size
     server_args = build_sglang_server_args(
         model_path,
         context_length=talker_max_seq_len,
@@ -580,4 +590,6 @@ def create_talker_ar_executor_from_config(
         weight_prefix=weight_prefix,
         speech_enabled=speech_enabled,
         feedback_enabled=feedback_enabled,
+        tp_rank=tp_rank,
+        nccl_port=nccl_port,
     )

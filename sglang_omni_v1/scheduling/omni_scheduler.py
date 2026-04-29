@@ -19,8 +19,10 @@ from collections import deque
 from typing import Any, Callable
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler as _Upstream
+from sglang.srt.utils import broadcast_pyobj
 
 from sglang_omni_v1.scheduling.messages import IncomingMessage, OutgoingMessage
 
@@ -114,7 +116,7 @@ class OmniScheduler:
         self.server_args = server_args
         self.model_config = model_config
         self.gpu_id = tp_worker.gpu_id
-        self.tp_rank = 0
+        self.tp_rank = getattr(tp_worker, "tp_rank", 0)
         self.tp_size = server_args.tp_size
         self.pp_rank = 0
         self.pp_size = server_args.pp_size
@@ -219,7 +221,7 @@ class OmniScheduler:
         # Feature flags (all disabled)
         self.enable_lora = False
         self.enable_pdmux = False
-        self.enable_metrics = False
+        self.enable_metrics = server_args.enable_metrics
         self.enable_trace = False
         self.enable_hierarchical_cache = False
         self.enable_hicache_storage = False
@@ -229,7 +231,9 @@ class OmniScheduler:
         self.stream_interval = 1
         self.max_recv_per_poll = 64
         self.enable_lora_overlap_loading = False
-        self.enable_metrics_for_all_schedulers = False
+        self.enable_metrics_for_all_schedulers = (
+            server_args.enable_metrics_for_all_schedulers
+        )
         self.current_scheduler_metrics_enabled = False
 
         # Speculative decoding (disabled)
@@ -259,16 +263,6 @@ class OmniScheduler:
         self.require_mlp_sync = False
         self.abort_on_priority_when_disabled = False
 
-        # Metrics mixin stubs
-        self.temp_prefill_info = None
-        self.forward_ct_decode = 0
-        self.num_generated_tokens = 0
-        self.last_decode_stats_tic = 0.0
-        self.last_prefill_stats_tic = 0.0
-        self.last_prefill_tokens = 0
-        self.last_gen_throughput = 0.0
-        self.last_input_throughput = 0.0
-
         # Disaggregation / hybrid (disabled)
         from sglang.srt.disaggregation.utils import DisaggregationMode
 
@@ -279,18 +273,27 @@ class OmniScheduler:
         self.is_initializing = False
         self.truncation_align_size = None
 
-        # Attention parallelism
-        self.attn_tp_rank = 0
-        self.attn_tp_size = 1
+        # Attention parallelism / TP ownership
+        self.attn_tp_rank = self.tp_rank
+        self.attn_tp_size = self.tp_size
         self.attn_dp_rank = 0
+        self.tp_group = None
+        self.tp_cpu_group = None
+        self.attn_tp_group = None
+        self.attn_tp_cpu_group = None
+        self.cpu_group = None
+        self.entry_rank = 0
+        self.is_entry_rank = self.tp_rank == 0
 
         # Misc
         self.metrics_collector = None
         self.pad_input_ids_func = None
         self.decode_mem_cache_buf_multiplier = 0
         self.decode_offload_manager = None
-        self.log_decode_stats_every_iteration = False
         self.send_to_detokenizer = _NoOpSender()
+
+        self._init_parallel_state(tp_worker)
+        self.init_metrics(self.tp_rank, self.pp_rank, self.dp_rank)
 
         self._running = False
         self._aborted_request_ids: set[str] = set()
@@ -328,6 +331,37 @@ class OmniScheduler:
             return types.MethodType(attr, self)
         return attr
 
+    def _init_parallel_state(self, tp_worker: Any) -> None:
+        enable_dp_attention = self.server_args.enable_dp_attention
+        self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
+            compute_dp_attention_world_info(
+                enable_dp_attention,
+                self.tp_rank,
+                self.tp_size,
+                self.dp_size,
+            )
+        )
+
+        self.tp_group = tp_worker.get_tp_group()
+        self.tp_cpu_group = self.tp_group.cpu_group
+        self.attn_tp_group = tp_worker.get_attention_tp_group()
+        self.attn_tp_cpu_group = tp_worker.get_attention_tp_cpu_group()
+
+        if enable_dp_attention:
+            self.cpu_group = self.attn_tp_cpu_group
+            self.entry_rank = self.attn_tp_group.first_rank
+            self.is_entry_rank = self.attn_tp_rank == 0
+        else:
+            self.cpu_group = self.tp_cpu_group
+            self.entry_rank = self.tp_group.first_rank
+            self.is_entry_rank = self.tp_group.rank_in_group == 0
+
+        self.pad_input_ids_func = tp_worker.get_pad_input_ids_func()
+
+        self.current_scheduler_metrics_enabled = (
+            self.attn_tp_rank == 0 or self.enable_metrics_for_all_schedulers
+        )
+
     # ------------------------------------------------------------------
     # Overridden methods (take precedence over __getattr__)
     # ------------------------------------------------------------------
@@ -339,14 +373,10 @@ class OmniScheduler:
         return batch
 
     def recv_requests(self):
-        """Drain inbox and return new-request payloads."""
+        """Drain inbox on rank 0 and broadcast scheduler inputs to TP followers."""
+        recv_msgs = self._recv_scheduler_messages()
         new_reqs: list = []
-        while True:
-            try:
-                msg = self.inbox.get_nowait()
-            except _queue_mod.Empty:
-                break
-
+        for msg in recv_msgs:
             if msg.request_id in self._aborted_request_ids:
                 continue
 
@@ -358,6 +388,27 @@ class OmniScheduler:
                 self._on_stream_done(msg.request_id)
 
         return new_reqs
+
+    def _recv_scheduler_messages(self) -> list[IncomingMessage]:
+        if self.tp_size == 1:
+            return self._drain_local_inbox()
+
+        recv_msgs = self._drain_local_inbox() if self.is_entry_rank else []
+        return broadcast_pyobj(
+            recv_msgs,
+            self.tp_group.rank,
+            self.tp_cpu_group,
+            src=self.tp_group.ranks[0],
+        )
+
+    def _drain_local_inbox(self) -> list[IncomingMessage]:
+        recv_msgs: list[IncomingMessage] = []
+        while True:
+            try:
+                recv_msgs.append(self.inbox.get_nowait())
+            except _queue_mod.Empty:
+                break
+        return recv_msgs
 
     def process_input_requests(self, recv_reqs):
         """Convert incoming payloads to SGLang Reqs and enqueue."""
