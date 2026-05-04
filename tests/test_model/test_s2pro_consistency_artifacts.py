@@ -25,9 +25,7 @@ def _load_speed_results(results_root_env: str, output_dir_name: str) -> dict:
 
     with open(matches[0]) as results_file:
         speed_results = json.load(results_file)
-    assert (
-        "per_request" in speed_results
-    ), f"Missing 'per_request' key in {matches[0]}"
+    assert "per_request" in speed_results, f"Missing 'per_request' key in {matches[0]}"
     return speed_results
 
 

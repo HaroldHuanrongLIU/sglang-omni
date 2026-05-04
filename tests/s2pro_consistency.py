@@ -40,9 +40,7 @@ def _assert_relative_difference(
     relative_tolerance: float,
 ) -> None:
     max_value = max(non_stream_value, stream_value)
-    assert abs(non_stream_value - stream_value) <= (
-        relative_tolerance * max_value
-    ), (
+    assert abs(non_stream_value - stream_value) <= (relative_tolerance * max_value), (
         f"{metric_name} differ too much - "
         f"non_stream={non_stream_value}, stream={stream_value} "
         f"(rtol={relative_tolerance})"
