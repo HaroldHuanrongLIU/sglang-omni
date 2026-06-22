@@ -47,20 +47,12 @@ def test_default_cuda_graph_bs_matches_sglang_normal_buckets() -> None:
     ]
 
 
-def test_validate_generation_batch_policy_reports_explicit_full_policy() -> None:
-    report = validate_generation_batch_policy(
+def test_validate_generation_batch_policy_accepts_explicit_full_policy() -> None:
+    validate_generation_batch_policy(
         model_name="test-model",
         server_args=_server_args(),
         model_buffer_bs=16,
     )
-
-    assert report.max_running_requests == 16
-    assert report.cuda_graph_enabled is True
-    assert report.cuda_graph_max_bs == 16
-    assert report.cuda_graph_bs == (1, 2, 4, 8, 12, 16)
-    assert report.torch_compile_enabled is True
-    assert report.torch_compile_max_bs == 16
-    assert report.model_buffer_bs == 16
 
 
 def test_validate_generation_batch_policy_rejects_implicit_cuda_graph_bs() -> None:
@@ -94,7 +86,7 @@ def test_validate_generation_batch_policy_requires_enabled_compile_coverage() ->
 
 
 def test_validate_generation_batch_policy_ignores_disabled_compile_cap() -> None:
-    report = validate_generation_batch_policy(
+    validate_generation_batch_policy(
         model_name="test-model",
         server_args=_server_args(
             max_running_requests=64,
@@ -104,8 +96,6 @@ def test_validate_generation_batch_policy_ignores_disabled_compile_cap() -> None
             torch_compile_max_bs=16,
         ),
     )
-    assert report.torch_compile_enabled is False
-    assert report.torch_compile_max_bs == 16
 
 
 def test_validate_generation_batch_policy_rejects_under_sized_model_buffer() -> None:

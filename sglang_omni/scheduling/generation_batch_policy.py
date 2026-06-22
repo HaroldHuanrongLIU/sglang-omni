@@ -4,20 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
 from typing import Any
-
-
-@dataclass(frozen=True)
-class GenerationBatchPolicyReport:
-    model_name: str
-    max_running_requests: int
-    cuda_graph_enabled: bool
-    cuda_graph_max_bs: int | None
-    cuda_graph_bs: tuple[int, ...] | None
-    torch_compile_enabled: bool
-    torch_compile_max_bs: int | None
-    model_buffer_bs: int | None
 
 
 def build_default_cuda_graph_bs(max_bs: int) -> list[int]:
@@ -55,7 +42,7 @@ def validate_generation_batch_policy(
     model_name: str,
     server_args: Any,
     model_buffer_bs: int | None = None,
-) -> GenerationBatchPolicyReport:
+) -> None:
     errors: list[str] = []
 
     max_running_requests = _read_positive_int(
@@ -133,18 +120,6 @@ def validate_generation_batch_policy(
         raise ValueError(
             f"{model_name} invalid generation batch policy: " + "; ".join(errors)
         )
-
-    assert max_running_requests is not None
-    return GenerationBatchPolicyReport(
-        model_name=model_name,
-        max_running_requests=max_running_requests,
-        cuda_graph_enabled=cuda_graph_enabled,
-        cuda_graph_max_bs=cuda_graph_max_bs,
-        cuda_graph_bs=cuda_graph_bs,
-        torch_compile_enabled=torch_compile_enabled,
-        torch_compile_max_bs=torch_compile_max_bs,
-        model_buffer_bs=normalized_model_buffer_bs,
-    )
 
 
 def _read_positive_int(
