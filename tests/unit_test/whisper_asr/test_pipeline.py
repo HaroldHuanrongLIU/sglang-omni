@@ -5,8 +5,13 @@ from __future__ import annotations
 import sys
 from types import SimpleNamespace
 
+import sglang_omni.model_runner.base as model_runner_base
 import sglang_omni.models.whisper_asr.stages as whisper_asr_stages
+import sglang_omni.scheduling.bootstrap as bootstrap
+import sglang_omni.scheduling.omni_scheduler as omni_scheduler
+import sglang_omni.scheduling.sglang_backend as sglang_backend
 from sglang_omni.models.registry import PIPELINE_CONFIG_REGISTRY
+from sglang_omni.models.whisper_asr import request_builders as whisper_request_builders
 from sglang_omni.models.whisper_asr.config import WhisperASRPipelineConfig
 
 
@@ -44,22 +49,22 @@ def test_whisper_asr_threads_explicit_cuda_graph_bs(monkeypatch) -> None:
         ),
     )
     monkeypatch.setattr(
-        whisper_asr_stages,
+        whisper_request_builders,
         "make_whisper_scheduler_adapters",
         lambda **kwargs: (object(), object()),
     )
     monkeypatch.setattr(
-        whisper_asr_stages,
+        model_runner_base,
         "ModelRunner",
         lambda *args, **kwargs: object(),
     )
     monkeypatch.setattr(
-        whisper_asr_stages,
+        sglang_backend,
         "SGLangOutputProcessor",
         lambda **kwargs: object(),
     )
     monkeypatch.setattr(
-        whisper_asr_stages,
+        omni_scheduler,
         "OmniScheduler",
         lambda **kwargs: SimpleNamespace(**kwargs),
     )
@@ -81,12 +86,12 @@ def test_whisper_asr_threads_explicit_cuda_graph_bs(monkeypatch) -> None:
         )
 
     monkeypatch.setattr(
-        whisper_asr_stages,
+        sglang_backend,
         "build_sglang_server_args",
         _fake_server_args_builder,
     )
     monkeypatch.setattr(
-        whisper_asr_stages,
+        bootstrap,
         "create_sglang_infrastructure_defer_cuda_graph",
         _fake_create_infrastructure,
     )
